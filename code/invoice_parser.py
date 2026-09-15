@@ -153,7 +153,7 @@ def _guess_category(item_name: str, seller_name: str) -> str:
 def _decimal(text: object) -> Optional[Decimal]:
     if text is None:
         return None
-    cleaned = str(text).replace("¥", "").replace(",", "").strip()
+    cleaned = str(text).replace("¥", "").replace("￥", "").replace(",", "").strip()
     if not re.fullmatch(r"-?\d+(?:\.\d+)?", cleaned):
         return None
     try:
@@ -179,6 +179,47 @@ def _text_in_column(words: list[tuple], x_min: float, x_max: float) -> str:
     return "".join(str(word[4]).strip() for word in selected).strip()
 
 
+def _parse_parties_from_page(page) -> tuple[str, str, str, str]:
+    """Read the two labelled party boxes independently of PDF object order."""
+    words = page.get_text("words")
+    headers = [w[1] for w in words if w[4] == "项目名称"]
+    if not headers:
+        return "", "", "", ""
+    header_y = min(headers)
+    parties = []
+    for left, right in ((0, page.rect.width / 2), (page.rect.width / 2, page.rect.width)):
+        box = [w for w in words if left <= w[0] < right and w[1] < header_y]
+        labels = [w for w in box if str(w[4]).startswith(("名称：", "名称:"))]
+        if not labels:
+            parties.extend(("", ""))
+            continue
+        label = max(labels, key=lambda w: w[1])
+        name_words = [w for w in box if w[0] > label[0] + 10 and abs(w[1] - label[1]) < 6]
+        name = re.split(r"[：:]", label[4], maxsplit=1)[-1]
+        name += _text_in_column(name_words, left, right)
+        tax_ids = [_normalise_tax_id(w[4]) for w in box
+                   if w[1] > label[1] and re.fullmatch(r"[0-9A-Z]{18}", _normalise_tax_id(w[4]))]
+        parties.extend((name.strip(), tax_ids[0] if len(tax_ids) == 1 else ""))
+    return tuple(parties)
+
+
+def _parse_totals_from_page(page) -> list[Decimal]:
+    words = page.get_text("words")
+    width = float(page.rect.width)
+    total_labels = [w for w in words if w[0] < width * .25 and w[4] in ("合", "合计")]
+    small_labels = [w for w in words if "小写" in w[4]]
+    if not total_labels or not small_labels:
+        return []
+    total_y = max(total_labels, key=lambda w: w[1])[1]
+    small = max(small_labels, key=lambda w: w[1])
+    total_words = [w for w in words if abs(w[1] - total_y) < 6]
+    small_words = [w for w in words if abs(w[1] - small[1]) < 6]
+    values = [_first_decimal(total_words, width * .65, width * .76),
+              _first_decimal(total_words, width * .90, width),
+              _first_decimal(small_words, small[2] - 5, width)]
+    return values if all(v is not None for v in values) else []
+
+
 def _parse_items_from_page(page) -> list[InvoiceItem]:
     """Parse common Chinese e-invoice detail rows using table geometry.
 
@@ -193,9 +234,13 @@ def _parse_items_from_page(page) -> list[InvoiceItem]:
     if not header_y_values:
         return []
     header_y = min(header_y_values)
+    description_header = next(w for w in words if w[4] == "项目名称" and w[1] == header_y)
+    specification_headers = [w for w in words if w[4] == "规格型号" and abs(w[1] - header_y) < 3]
+    description_end = ((description_header[2] + specification_headers[0][0]) / 2
+                       if specification_headers else width * .18)
     total_y_values = [
         word[1] for word in words
-        if word[1] > header_y + 20 and word[0] < width * 0.25 and str(word[4]).strip() == "合"
+        if word[1] > header_y + 20 and word[0] < width * 0.25 and str(word[4]).strip() in {"合", "合计"}
     ]
     # Total values are often printed a few points above the visual “合计” label.
     total_y = min(total_y_values) - 5 if total_y_values else max(word[1] for word in words) + 1
@@ -213,8 +258,8 @@ def _parse_items_from_page(page) -> list[InvoiceItem]:
         row_start = anchor[1] - 2.5
         row_end = amount_anchors[index + 1][1] - 2.5 if index + 1 < len(amount_anchors) else total_y
         row_words = [word for word in words if row_start <= word[1] < row_end]
-        description = _text_in_column(row_words, 0, width * 0.20)
-        specification = _text_in_column(row_words, width * 0.20, width * 0.31)
+        description = _text_in_column(row_words, 0, description_end)
+        specification = _text_in_column(row_words, description_end, width * 0.31)
         unit = _text_in_column(row_words, width * 0.31, width * 0.42)
         quantity = _first_decimal(row_words, width * 0.42, width * 0.49)
         unit_price = _first_decimal(row_words, width * 0.49, width * 0.66)
@@ -281,9 +326,12 @@ def parse_invoice(pdf_path: str | Path) -> InvoiceData:
         if document.is_encrypted and not document.authenticate(""):
             raise ValueError("PDF 已加密，无法读取。")
         text = "\n".join(page.get_text("text") for page in document)
+        parties = _parse_parties_from_page(document[0]) if len(document) else ("", "", "", "")
+        printed_totals = []
         items = []
         for page in document:
             items.extend(_parse_items_from_page(page))
+            printed_totals = _parse_totals_from_page(page) or printed_totals
     finally:
         document.close()
 
@@ -311,21 +359,21 @@ def parse_invoice(pdf_path: str | Path) -> InvoiceData:
         candidate = _normalise_tax_id(line)
         if re.fullmatch(r"[0-9A-Z]{18}", candidate) and candidate not in tax_candidates:
             tax_candidates.append(candidate)
-    buyer_tax_id = tax_candidates[0] if tax_candidates else ""
-    seller_tax_id = tax_candidates[1] if len(tax_candidates) > 1 else ""
+    buyer_tax_id = parties[1] or (tax_candidates[0] if tax_candidates else "")
+    seller_tax_id = parties[3] or (tax_candidates[1] if len(tax_candidates) > 1 else "")
     if not buyer_tax_id:
         _warning(warnings, "MISSING_BUYER_TAX_ID", "未识别到购买方税号。", "buyer_tax_id")
     if not seller_tax_id:
         _warning(warnings, "MISSING_SELLER_TAX_ID", "未识别到销售方税号。", "seller_tax_id")
-    buyer_name = _previous_meaningful_line(lines, buyer_tax_id) if buyer_tax_id else ""
-    seller_name = _previous_meaningful_line(lines, seller_tax_id) if seller_tax_id else ""
+    buyer_name = parties[0] or (_previous_meaningful_line(lines, buyer_tax_id) if buyer_tax_id else "")
+    seller_name = parties[2] or (_previous_meaningful_line(lines, seller_tax_id) if seller_tax_id else "")
     if not buyer_name:
         _warning(warnings, "MISSING_BUYER_NAME", "未识别到购买方名称。", "buyer_name")
     if not seller_name:
         _warning(warnings, "MISSING_SELLER_NAME", "未识别到销售方名称。", "seller_name")
 
-    money_values = [
-        Decimal(value) for value in re.findall(r"¥\s*(-?[0-9]+(?:\.[0-9]+)?)", compact_text)
+    money_values = printed_totals or [
+        Decimal(value.replace(",", "")) for value in re.findall(r"[¥￥]\s*(-?[0-9,]+(?:\.[0-9]+)?)", compact_text)
     ]
     amount_without_tax = money_values[0] if len(money_values) >= 1 else Decimal("0.00")
     tax_amount = money_values[1] if len(money_values) >= 2 else Decimal("0.00")
@@ -356,15 +404,18 @@ def parse_invoice(pdf_path: str | Path) -> InvoiceData:
     name_source = positive_items or [item for item in items if item.description]
     distinct_names = list(dict.fromkeys(item.description for item in name_source))
     item_name = "；".join(distinct_names)
-    short_name = _shorten_item(distinct_names[0]) if distinct_names else ""
+    short_name = "、".join(dict.fromkeys(_shorten_item(name) for name in distinct_names))
     if not item_name:
         _warning(warnings, "MISSING_ITEM_NAME", "未识别到发票项目名称。", "item_name")
     if not short_name:
         _warning(warnings, "MISSING_SHORT_NAME", "无法自动生成统计表简称。", "short_name")
 
     primary_item = positive_items[0] if positive_items else (items[0] if items else InvoiceItem())
+    # The inventory currently writes one consolidated row per invoice. Do not
+    # assign the first product's quantity/unit to several different products.
+    consolidated = len(positive_items) > 1
     tax_rate = primary_item.tax_rate
-    quantity = primary_item.quantity if primary_item.quantity is not None else Decimal("1")
+    quantity = Decimal("1") if consolidated else (primary_item.quantity if primary_item.quantity is not None else Decimal("1"))
     category_guess = _guess_category(item_name, seller_name)
     status = InvoiceStatus.REVIEW_REQUIRED if warnings else InvoiceStatus.PARSED_OK
 
@@ -378,11 +429,11 @@ def parse_invoice(pdf_path: str | Path) -> InvoiceData:
         seller_tax_id=seller_tax_id,
         item_name=item_name,
         short_name=short_name,
-        specification=primary_item.specification or "-",
+        specification="详见发票明细" if consolidated else (primary_item.specification or "-"),
         unit_raw=primary_item.unit,
-        unit_for_inventory=UNIT_MAP.get(primary_item.unit.lower(), primary_item.unit or "-"),
+        unit_for_inventory="批" if consolidated else UNIT_MAP.get(primary_item.unit.lower(), primary_item.unit or "-"),
         quantity=quantity,
-        unit_price=primary_item.unit_price,
+        unit_price=None if consolidated else primary_item.unit_price,
         amount_without_tax=amount_without_tax.quantize(Decimal("0.01")),
         tax_amount=tax_amount.quantize(Decimal("0.01")),
         total_amount=total_amount.quantize(Decimal("0.01")),

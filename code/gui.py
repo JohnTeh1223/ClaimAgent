@@ -304,7 +304,6 @@ class ReimbursementApp(tk.Tk):
         dialog.title(f"发票明细复核 — {item.source_path.name}")
         dialog.geometry("980x610")
         dialog.transient(self)
-        dialog.grab_set()
 
         columns = ("description", "quantity", "amount", "tax", "type")
         tree = ttk.Treeview(dialog, columns=columns, show="headings", height=9)
@@ -338,16 +337,19 @@ class ReimbursementApp(tk.Tk):
         editor.columnconfigure(3, weight=1)
         selected_index: list[int | None] = [None]
 
+        def row_values(detail: InvoiceItem) -> tuple:
+            return (
+                detail.description,
+                "" if detail.quantity is None else str(detail.quantity),
+                "" if detail.amount is None else str(detail.amount),
+                "" if detail.tax_amount is None else str(detail.tax_amount),
+                "折扣/负数" if detail.is_negative else "普通",
+            )
+
         def refresh_tree(select_index: int | None = None) -> None:
             tree.delete(*tree.get_children())
             for index, detail in enumerate(working):
-                tree.insert("", "end", iid=str(index), values=(
-                    detail.description,
-                    "" if detail.quantity is None else str(detail.quantity),
-                    "" if detail.amount is None else str(detail.amount),
-                    "" if detail.tax_amount is None else str(detail.tax_amount),
-                    "折扣/负数" if detail.is_negative else "普通",
-                ))
+                tree.insert("", "end", iid=str(index), values=row_values(detail))
             if select_index is not None and tree.exists(str(select_index)):
                 tree.selection_set(str(select_index))
                 tree.focus(str(select_index))
@@ -357,7 +359,7 @@ class ReimbursementApp(tk.Tk):
             if index is None or index >= len(working):
                 return True
             try:
-                detail = working[index]
+                detail = copy.deepcopy(working[index])
                 detail.description = detail_vars["description"].get().strip()
                 detail.specification = detail_vars["specification"].get().strip()
                 detail.unit = detail_vars["unit"].get().strip()
@@ -372,7 +374,10 @@ class ReimbursementApp(tk.Tk):
             except ValueError as exc:
                 messagebox.showerror("明细数字无效", str(exc), parent=dialog)
                 return False
-            refresh_tree(index)
+            working[index] = detail
+            # Saving during a selection event must not rebuild/reselect rows:
+            # doing so queues another selection event and can loop forever.
+            tree.item(str(index), values=row_values(detail))
             return True
 
         def load_selected(_event=None) -> None:
@@ -380,7 +385,11 @@ class ReimbursementApp(tk.Tk):
             if not selection:
                 return
             new_index = int(selection[0])
+            if new_index == selected_index[0]:
+                return
             if selected_index[0] is not None and selected_index[0] != new_index and not save_selected():
+                tree.selection_set(str(selected_index[0]))
+                tree.focus(str(selected_index[0]))
                 return
             selected_index[0] = new_index
             detail = working[new_index]
@@ -398,8 +407,8 @@ class ReimbursementApp(tk.Tk):
             if not save_selected():
                 return
             working.append(InvoiceItem())
-            selected_index[0] = len(working) - 1
-            refresh_tree(selected_index[0])
+            selected_index[0] = None
+            refresh_tree(len(working) - 1)
             load_selected()
 
         def delete_detail() -> None:
@@ -433,6 +442,17 @@ class ReimbursementApp(tk.Tk):
         refresh_tree(0 if working else None)
         if working:
             load_selected()
+
+        # Acquire modal input only once the fully built window is visible.
+        # This avoids trapping clicks in an unpainted/hidden dialog on Windows.
+        def activate_dialog(event) -> None:
+            if event.widget is dialog:
+                dialog.unbind("<Map>")
+                dialog.lift()
+                dialog.grab_set()
+                tree.focus_set()
+
+        dialog.bind("<Map>", activate_dialog)
 
     def save_current(self, *, show_message: bool = True) -> bool:
         if self.current_index is None:

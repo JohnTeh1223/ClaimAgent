@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import traceback
+from file_ops import copy_file
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -112,7 +114,7 @@ def load_config(config_path: Path | None = None) -> dict:
 
 
 def sanitize_filename_part(text: str) -> str:
-    text = re.sub(r'[<>:"/\\|?*]', "", text)
+    text = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "", text)
     text = re.sub(r"\s+", " ", text).strip().rstrip(".")
     return text[:80] or "未命名"
 
@@ -554,7 +556,7 @@ def _log_item(item: ReviewItem, target: Path, completed: Path) -> dict:
 
 
 def _copy_official_pdf(source: Path, target: Path) -> None:
-    shutil.copy2(source, target)
+    copy_file(source, target)
 
 
 def execute_batch(items: list[ReviewItem], config: dict, *, confirmed: bool) -> BatchExecutionResult:
@@ -578,7 +580,16 @@ def execute_batch(items: list[ReviewItem], config: dict, *, confirmed: bool) -> 
     backup_root.mkdir(parents=True, exist_ok=True)
     completed_dir.mkdir(parents=True, exist_ok=True)
 
-    write_result = write_batch_with_rollback(stats_path, inventory_path, backup_root, active)
+    try:
+        write_result = write_batch_with_rollback(stats_path, inventory_path, backup_root, active)
+    except Exception as exc:
+        try:
+            append_log(config, {"event": "batch_write", "result": "failed",
+                                "stage": "backup_or_wps", "error": str(exc),
+                                "traceback": traceback.format_exc()})
+        except Exception:
+            pass
+        raise
     backup_dir = Path(write_result.backup_dir)
     official_created: list[Path] = []
     moved_sources: list[tuple[Path, Path]] = []

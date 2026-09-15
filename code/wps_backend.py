@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import shutil
+from file_ops import copy_file
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -94,7 +94,7 @@ def backup_files(paths: list[Path], backup_root: Path) -> Path:
     dst.mkdir(parents=True, exist_ok=True)
     for path in paths:
         if path and path.exists():
-            shutil.copy2(path, dst / path.name)
+            copy_file(path, dst / path.name)
     return dst
 
 
@@ -333,7 +333,7 @@ def write_with_rollback(
         for original in paths_to_backup:
             backup = backup_dir / original.name
             if backup.exists():
-                shutil.copy2(backup, original)
+                copy_file(backup, original)
         raise
     finally:
         controller.quit()
@@ -346,7 +346,7 @@ def restore_from_backup(backup_dir: Path, originals: list[Path]):
             continue
         backup = backup_dir / original.name
         if backup.exists():
-            shutil.copy2(backup, original)
+            copy_file(backup, original)
 
 
 def open_in_wps(paths: list[Path]):
