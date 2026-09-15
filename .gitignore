@@ -1,0 +1,18 @@
+# 发票、备份和日志
+01-待处理/
+02-待复核/
+03-已完成/
+others/backup/
+others/logs/
+
+# 本地配置
+config.json
+.env
+.env.*
+
+# Python 缓存和虚拟环境
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
