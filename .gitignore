@@ -4,11 +4,15 @@
 03-已完成/
 others/backup/
 others/logs/
+others/signatures/
+output/pdf/
+
 
 # 本地配置
 config.json
 .env
 .env.*
+/tmp/
 
 # Python 缓存和虚拟环境
 __pycache__/

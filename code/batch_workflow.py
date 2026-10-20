@@ -18,6 +18,7 @@ from invoice_parser import (
     InvoiceStatus,
     parse_invoice,
 )
+from pdf_signature import selected_signature, render_signed_pdf, atomic_write
 from wps_backend import open_in_wps, restore_from_backup, write_batch_with_rollback
 
 
@@ -349,6 +350,14 @@ def write_review_metadata(invoice: InvoiceData, config: dict, item: ReviewItem |
             ],
         },
     }
+    # Keep the PDF extraction separate from edited values so a subsequent
+    # scan can distinguish user edits from an automatically saved snapshot.
+    payload["extracted"].update(invoice.extracted_parties)
+    for key, stored_key in (("amount_without_tax", "total_without_tax"),
+                            ("tax_amount", "total_tax"), ("total_amount", "grand_total"),
+                            ("items", "items")):
+        if key in invoice.extracted_values:
+            payload["extracted"][stored_key] = invoice.extracted_values[key]
     metadata_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return metadata_path
 
@@ -358,13 +367,52 @@ def apply_review_metadata(invoice: InvoiceData, config: dict) -> dict:
     if not metadata_path.is_file():
         return {}
     try:
-        manual = json.loads(metadata_path.read_text(encoding="utf-8")).get("manual", {})
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        manual = payload.get("manual", {})
     except (json.JSONDecodeError, OSError):
         return {}
     if not isinstance(manual, dict) or not manual:
         return {}
+    manual = dict(manual)
+    extracted = payload.get("extracted", {})
+    # Refresh untouched automatic amounts and details, including old confirmed
+    # snapshots. Compare details without raw text, which older snapshots omit.
+    def comparable_details(details):
+        if not isinstance(details, list):
+            return None
+        return [{key: value for key, value in detail.items() if key != "raw_text"}
+                for detail in details if isinstance(detail, dict)]
+
+    for key, stored_key in (("amount_without_tax", "total_without_tax"),
+                            ("tax_amount", "total_tax"), ("total_amount", "grand_total"),
+                            ("items", "items")):
+        if not isinstance(extracted, dict) or key not in manual or stored_key not in extracted:
+            continue
+        previous, saved = extracted[stored_key], manual[key]
+        fresh = invoice.extracted_values.get(key)
+        if fresh is None:
+            continue
+        if key == "items":
+            previous, saved, fresh = map(comparable_details, (previous, saved, fresh))
+        else:
+            previous, saved, fresh = str(previous), str(saved), str(fresh)
+        if saved == previous:
+            if saved != fresh:
+                manual["review_acknowledged"] = False
+            manual.pop(key)
     for key in ("invoice_no", "invoice_date", "buyer_name", "buyer_tax_id", "seller_name", "seller_tax_id", "item_name"):
         if key in manual:
+            # Confirmation alone does not make an unchanged snapshot an edit.
+            # Old confirmed snapshots can still contain parser mistakes.
+            extracted = payload.get("extracted", {})
+            if (key in {"buyer_name", "buyer_tax_id", "seller_name", "seller_tax_id"}
+                    and isinstance(extracted, dict) and key in extracted
+                    and str(manual[key]) == str(extracted[key])):
+                fresh = getattr(invoice, key)
+                if str(manual[key]) != fresh:
+                    manual[key] = fresh
+                    manual["review_acknowledged"] = False
+                continue
             setattr(invoice, key, str(manual[key]))
     for key in ("amount_without_tax", "tax_amount", "total_amount"):
         if manual.get(key) not in (None, ""):
@@ -468,6 +516,16 @@ def scan_input_directory(config: dict, *, route_parse_failures: bool = True) -> 
 def preflight_batch(items: Iterable[ReviewItem], config: dict) -> dict[str, list[str]]:
     active = [item for item in items if item.included and not item.needs_review]
     errors: dict[str, list[str]] = {str(item.source_path): validate_review_item(item, config) for item in active}
+    try:
+        asset = selected_signature(config)
+        if asset is not None:
+            for item in active:
+                try:
+                    render_signed_pdf(item.source_path, asset, config['signature'].get('width', 130))
+                except Exception as exc:
+                    errors[str(item.source_path)].append(f'签名无法放置：{exc}')
+    except Exception as exc:
+        errors.setdefault('电子签名', []).append(str(exc))
     stats_path = Path(config["wps_root"]) / config["stats_file"]
     if not stats_path.is_file():
         errors.setdefault("批次", []).append(f"找不到待报销统计表：{stats_path}")
@@ -573,6 +631,14 @@ def execute_batch(items: list[ReviewItem], config: dict, *, confirmed: bool) -> 
         raise ValueError(f"最终写入前检查未通过：{detail}")
 
     wps_root = Path(config["wps_root"])
+    # Prepare every signed PDF before modifying WPS so placement failures
+    # cannot leave a partly written batch. Use one signature for the batch.
+    asset = selected_signature(config)
+    signed_pdfs = {}
+    if asset is not None:
+        for item in active:
+            signed_pdfs[item.source_path] = render_signed_pdf(
+                item.source_path, asset, config['signature'].get('width', 130))[0]
     stats_path = wps_root / config["stats_file"]
     inventory_path = wps_root / config["inventory_file"] if config.get("inventory_file") else None
     backup_root = Path(config["backup_dir"])
@@ -600,14 +666,20 @@ def execute_batch(items: list[ReviewItem], config: dict, *, confirmed: bool) -> 
             target_dir.mkdir(parents=True, exist_ok=True)
             target = target_dir / item.target_filename
             official_created.append(target)
-            _copy_official_pdf(item.source_path, target)
+            if item.source_path in signed_pdfs:
+                atomic_write(target, signed_pdfs[item.source_path])
+            else:
+                _copy_official_pdf(item.source_path, target)
 
         for item, target in zip(active, official_created):
             completed = completed_dir / item.source_path.name
             source = item.source_path
             shutil.move(str(source), str(completed))
             moved_sources.append((source, completed))
-            log_items.append(_log_item(item, target, completed))
+            record = _log_item(item, target, completed)
+            if asset is not None:
+                record['signature_user'] = config['signature'].get('name', '')
+            log_items.append(record)
 
         log_path = append_log(
             config,

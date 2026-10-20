@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import copy
+import io
 import tkinter as tk
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from PIL import Image, ImageTk
+import fitz
 
 from batch_workflow import (
     CATEGORIES,
@@ -20,6 +23,8 @@ from batch_workflow import (
     write_review_metadata,
 )
 from invoice_parser import InvoiceItem, InvoiceStatus
+from pdf_signature import (import_signature, read_profiles, save_profiles, signature_settings,
+                           selected_signature, render_signed_pdf)
 
 
 class ReimbursementApp(tk.Tk):
@@ -29,6 +34,8 @@ class ReimbursementApp(tk.Tk):
         self.geometry("1320x820")
         self.minsize(1080, 700)
         self.config_data = load_config()
+        self.signature_profiles = read_profiles()
+        self.config_data['signature'] = signature_settings(self.signature_profiles)
         self.items: list[ReviewItem] = []
         self.current_index: int | None = None
         self._build_ui()
@@ -44,6 +51,20 @@ class ReimbursementApp(tk.Tk):
 
         self.status_var = tk.StringVar(value="准备扫描……")
         ttk.Label(toolbar, textvariable=self.status_var).pack(side="right", padx=18)
+
+        signature_bar = ttk.Frame(self, padding=(10, 0, 10, 8))
+        signature_bar.pack(fill='x')
+        self.signature_enabled = tk.BooleanVar(value=self.signature_profiles.get('enabled', False))
+        ttk.Checkbutton(signature_bar, text='为报销 PDF 添加电子签名', variable=self.signature_enabled,
+                        command=self._change_signature).pack(side='left')
+        ttk.Label(signature_bar, text='使用者：').pack(side='left', padx=(16, 4))
+        self.signature_user = tk.StringVar()
+        self.signature_combo = ttk.Combobox(signature_bar, textvariable=self.signature_user, state='readonly', width=28)
+        self.signature_combo.pack(side='left')
+        self.signature_combo.bind('<<ComboboxSelected>>', self._change_signature)
+        ttk.Button(signature_bar, text='上传签名', command=self._upload_signature).pack(side='left', padx=8)
+        ttk.Button(signature_bar, text='预览当前发票签名', command=self._preview_signature).pack(side='left')
+        self._refresh_signature_users()
 
         pane = ttk.Panedwindow(self, orient="horizontal")
         pane.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -157,6 +178,90 @@ class ReimbursementApp(tk.Tk):
         form_frame.columnconfigure(1, weight=1)
         form_frame.columnconfigure(3, weight=1)
         form_frame.rowconfigure(row, weight=1)
+
+    def _refresh_signature_users(self) -> None:
+        profiles = self.signature_profiles['profiles']
+        self.signature_combo['values'] = [f"{p['name']} ({p['id'][:6]})" for p in profiles]
+        for index, profile in enumerate(profiles):
+            if profile['id'] == self.signature_profiles.get('selected'):
+                self.signature_combo.current(index)
+                break
+        self.signature_enabled.set(bool(self.signature_profiles.get('enabled')))
+
+    def _change_signature(self, _event=None) -> None:
+        previous = copy.deepcopy(self.signature_profiles)
+        index = self.signature_combo.current()
+        if index >= 0:
+            self.signature_profiles['selected'] = self.signature_profiles['profiles'][index]['id']
+        self.signature_profiles['enabled'] = self.signature_enabled.get()
+        try:
+            save_profiles(self.signature_profiles)
+            self.config_data['signature'] = signature_settings(self.signature_profiles)
+        except Exception as exc:
+            self.signature_profiles = previous
+            self._refresh_signature_users()
+            messagebox.showerror('保存签名设置失败', str(exc), parent=self)
+
+    def _upload_signature(self) -> None:
+        path = filedialog.askopenfilename(parent=self, title='选择使用者的签名图片',
+                                         filetypes=[('签名图片', '*.png *.jpg *.jpeg *.bmp *.webp')])
+        if not path:
+            return
+        name = simpledialog.askstring('使用者姓名', '这是谁的签名？请输入姓名：', parent=self)
+        if not name:
+            return
+        try:
+            self.signature_profiles = import_signature(path, name)
+            self.config_data['signature'] = signature_settings(self.signature_profiles)
+            self._refresh_signature_users()
+            self.status_var.set(f'已选用 {name.strip()} 的签名，可预览当前发票')
+        except Exception as exc:
+            messagebox.showerror('上传签名失败', str(exc), parent=self)
+
+    def _preview_signature(self) -> None:
+        if self.current_index is None:
+            messagebox.showinfo('签名预览', '请先选择一张发票。', parent=self)
+            return
+        try:
+            asset = selected_signature(self.config_data)
+            if asset is None:
+                raise ValueError('请先上传、选择签名，并勾选添加电子签名。')
+            pdf, _ = render_signed_pdf(self.items[self.current_index].source_path, asset)
+            document = fitz.open(stream=pdf, filetype='pdf')
+        except Exception as exc:
+            messagebox.showerror('签名预览失败', str(exc), parent=self)
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title(f"签名预览 — {self.config_data['signature']['name']}")
+        dialog.transient(self)
+        dialog.grab_set()
+        label = ttk.Label(dialog)
+        label.pack(padx=10, pady=10)
+        controls = ttk.Frame(dialog)
+        controls.pack(fill='x', padx=10, pady=(0, 10))
+        page_label = tk.StringVar()
+        ttk.Label(controls, textvariable=page_label).pack(side='left')
+        current = [0]
+
+        def show(delta=0):
+            current[0] = max(0, min(len(document) - 1, current[0] + delta))
+            page = document[current[0]]
+            scale = min(1000 / page.rect.width, (self.winfo_screenheight() - 180) / page.rect.height)
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+            picture = ImageTk.PhotoImage(Image.open(io.BytesIO(pixmap.tobytes('png'))), master=dialog)
+            label.configure(image=picture)
+            label.image = picture
+            page_label.set(f'第 {current[0] + 1} / {len(document)} 页；签名仅加入报销 PDF')
+
+        def close():
+            document.close()
+            dialog.destroy()
+
+        ttk.Button(controls, text='关闭', command=close).pack(side='right')
+        ttk.Button(controls, text='下一页', command=lambda: show(1)).pack(side='right', padx=6)
+        ttk.Button(controls, text='上一页', command=lambda: show(-1)).pack(side='right')
+        dialog.protocol('WM_DELETE_WINDOW', close)
+        show()
 
     def reload_queue(self) -> None:
         if self.current_index is not None:
@@ -581,6 +686,8 @@ class ReimbursementApp(tk.Tk):
             f"发票数量：{summary.invoice_count}",
             f"价税合计：¥{summary.total_amount:.2f}",
             f"其中材料费：{summary.material_count} 张（会同时修改入库单）",
+            (f"电子签名：{self.config_data['signature']['name']}（每页空白处自动放置）"
+             if self.config_data['signature'].get('enabled') else '电子签名：未启用'),
             "",
             "分类汇总：",
         ]

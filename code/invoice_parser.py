@@ -64,6 +64,8 @@ class InvoiceData:
     status: InvoiceStatus = InvoiceStatus.PARSED_OK
     warnings: list[InvoiceWarning] = field(default_factory=list)
     raw_text: str = ""
+    extracted_parties: dict[str, str] = field(default_factory=dict, repr=False)
+    extracted_values: dict = field(default_factory=dict, repr=False)
 
     @property
     def invoice_number(self) -> str:
@@ -182,25 +184,106 @@ def _text_in_column(words: list[tuple], x_min: float, x_max: float) -> str:
 def _parse_parties_from_page(page) -> tuple[str, str, str, str]:
     """Read the two labelled party boxes independently of PDF object order."""
     words = page.get_text("words")
-    headers = [w[1] for w in words if w[4] == "项目名称"]
-    if not headers:
+    anchors = {}
+    for role, title in (("buyer", "购买方"), ("seller", "销售方")):
+        candidates = []
+        for word in words:
+            token = re.sub(r"\s+", "", str(word[4]))
+            if token in (title, title + "信息"):
+                candidates.append(word)
+            elif token == title[0]:
+                # Vertical labels can be stored as five separate PDF objects.
+                column = sorted((w for w in words if abs(w[0] - word[0]) < 3
+                                 and word[1] <= w[1] <= word[1] + 6 * (word[3] - word[1])),
+                                key=lambda w: w[1])
+                if "".join(str(w[4]).strip() for w in column).startswith(title):
+                    candidates.append(word)
+        if len(candidates) == 1:
+            anchors[role] = candidates[0]
+
+    # Without both labels the box boundary is uncertain; do not allow a
+    # missing buyer value to be filled using the seller's neighbouring box.
+    if len(anchors) != 2:
         return "", "", "", ""
-    header_y = min(headers)
+
     parties = []
-    for left, right in ((0, page.rect.width / 2), (page.rect.width / 2, page.rect.width)):
-        box = [w for w in words if left <= w[0] < right and w[1] < header_y]
-        labels = [w for w in box if str(w[4]).startswith(("名称：", "名称:"))]
-        if not labels:
+    for role in ("buyer", "seller"):
+        anchor = anchors.get(role)
+        if anchor is None:
             parties.extend(("", ""))
             continue
-        label = max(labels, key=lambda w: w[1])
-        name_words = [w for w in box if w[0] > label[0] + 10 and abs(w[1] - label[1]) < 6]
-        name = re.split(r"[：:]", label[4], maxsplit=1)[-1]
-        name += _text_in_column(name_words, left, right)
-        tax_ids = [_normalise_tax_id(w[4]) for w in box
-                   if w[1] > label[1] and re.fullmatch(r"[0-9A-Z]{18}", _normalise_tax_id(w[4]))]
-        parties.extend((name.strip(), tax_ids[0] if len(tax_ids) == 1 else ""))
+        left, right = anchor[0], float(page.rect.width)
+        top, bottom = anchor[1] - 3, float(page.rect.height)
+        for other in anchors.values():
+            if other is anchor:
+                continue
+            if abs(other[1] - anchor[1]) < 10 and other[0] > left:
+                right = min(right, other[0])
+            elif other[1] > top + 10:
+                bottom = min(bottom, other[1] - 3)
+        headers = [w[1] for w in words if w[1] > top and
+                   re.sub(r"\s+", "", str(w[4])) in ("项目名称", "货物或应税劳务、服务名称")]
+        if headers:
+            bottom = min(bottom, min(headers))
+        # Reconstruct visual rows before matching labels: “名” and “称:”
+        # may be separate words, while a tax label and its value may be one.
+        rows = []
+        box = [w for w in words if left <= w[0] < right and top <= w[1] < bottom
+               and not (abs(w[0] - left) < 3 and str(w[4]).strip() in "购买销售方信息")]
+        for word in sorted(box, key=lambda w: ((w[1] + w[3]) / 2, w[0])):
+            center = (word[1] + word[3]) / 2
+            row = next((row for row in rows if abs(row[0] - center) < 5), None)
+            if row is None:
+                rows.append((center, [word]))
+            else:
+                row[1].append(word)
+        names, tax_ids = [], []
+        for _, row in rows:
+            text = "".join(str(w[4]).strip() for w in sorted(row, key=lambda w: w[0]))
+            if any(abs(w[0] - left) < 3 and str(w[4]).startswith("息统一社会信用代码/") for w in row):
+                text = text.removeprefix("息")
+            name = re.match(r"^名\s*称\s*[：:]\s*(.*)$", text)
+            if name and name.group(1).strip():
+                names.append(name.group(1).strip())
+            tax = re.fullmatch(r"(?:统一社会信用代码/)?纳税人识别号[：:]([0-9A-Z]{15}|[0-9A-Z]{18}|[0-9A-Z]{20})",
+                               _normalise_tax_id(text))
+            if tax:
+                tax_ids.append(tax.group(1))
+        parties.extend((names[0] if len(names) == 1 else "",
+                        tax_ids[0] if len(tax_ids) == 1 else ""))
     return tuple(parties)
+
+
+def _table_columns(page) -> dict[str, tuple[float, float]]:
+    """Locate columns from the visible header, including split label words."""
+    words = page.get_text("words")
+    headers = [w for w in words if w[4] == "项目名称"]
+    if not headers:
+        return {}
+    header = min(headers, key=lambda w: w[1])
+    names = {"项目名称", "规格型号", "单位", "数量", "单价", "金额", "税率/征收率", "税额"}
+    labels = []
+    pending = []
+    for word in sorted((w for w in words if abs(w[1] - header[1]) < 3), key=lambda w: w[0]):
+        pending.append(word)
+        name = "".join(re.sub(r"\s+", "", str(w[4])) for w in pending)
+        if name in names:
+            labels.append((name, (pending[0][0] + pending[-1][2]) / 2))
+            pending = []
+    order = [name for name, _ in labels]
+    if pending or order not in (
+        ["项目名称", "规格型号", "单位", "数量", "单价", "金额", "税率/征收率", "税额"],
+        ["项目名称", "单价", "数量", "金额", "税率/征收率", "税额"],
+    ):
+        return {}
+    boundaries = [0.0] + [(a[1] + b[1]) / 2 for a, b in zip(labels, labels[1:])] + [float(page.rect.width) + 1]
+    return {name: (boundaries[i], boundaries[i + 1]) for i, (name, _) in enumerate(labels)}
+
+
+def _column_words(words: list[tuple], bounds: tuple[float, float]) -> list[tuple]:
+    # Numeric values are right-aligned; long unit prices can cross the left
+    # boundary while still ending in their own column.
+    return [w for w in words if bounds[0] <= (w[2] if _decimal(w[4]) is not None else w[0]) < bounds[1]]
 
 
 def _parse_totals_from_page(page) -> list[Decimal]:
@@ -214,8 +297,11 @@ def _parse_totals_from_page(page) -> list[Decimal]:
     small = max(small_labels, key=lambda w: w[1])
     total_words = [w for w in words if abs(w[1] - total_y) < 6]
     small_words = [w for w in words if abs(w[1] - small[1]) < 6]
-    values = [_first_decimal(total_words, width * .65, width * .76),
-              _first_decimal(total_words, width * .90, width),
+    columns = _table_columns(page)
+    amount_words = _column_words(total_words, columns.get("金额", (width * .65, width * .76)))
+    tax_words = _column_words(total_words, columns.get("税额", (width * .90, width + 1)))
+    values = [_first_decimal(amount_words, 0, width),
+              _first_decimal(tax_words, 0, width),
               _first_decimal(small_words, small[2] - 5, width)]
     return values if all(v is not None for v in values) else []
 
@@ -230,6 +316,7 @@ def _parse_items_from_page(page) -> list[InvoiceItem]:
     if not words:
         return []
     width = float(page.rect.width)
+    columns = _table_columns(page)
     header_y_values = [word[1] for word in words if str(word[4]).replace(" ", "") == "项目名称"]
     if not header_y_values:
         return []
@@ -249,7 +336,7 @@ def _parse_items_from_page(page) -> list[InvoiceItem]:
     for word in words:
         if not (header_y < word[1] < total_y):
             continue
-        if width * 0.66 <= word[0] < width * 0.76 and _decimal(word[4]) is not None:
+        if _decimal(word[4]) is not None and _column_words([word], columns.get("金额", (width * .66, width * .76))):
             amount_anchors.append(word)
     amount_anchors.sort(key=lambda value: (value[1], value[0]))
 
@@ -258,14 +345,18 @@ def _parse_items_from_page(page) -> list[InvoiceItem]:
         row_start = anchor[1] - 2.5
         row_end = amount_anchors[index + 1][1] - 2.5 if index + 1 < len(amount_anchors) else total_y
         row_words = [word for word in words if row_start <= word[1] < row_end]
-        description = _text_in_column(row_words, 0, description_end)
-        specification = _text_in_column(row_words, description_end, width * 0.31)
-        unit = _text_in_column(row_words, width * 0.31, width * 0.42)
-        quantity = _first_decimal(row_words, width * 0.42, width * 0.49)
-        unit_price = _first_decimal(row_words, width * 0.49, width * 0.66)
+        def column(name, fallback):
+            bounds = columns.get(name) if columns else fallback
+            return _column_words(row_words, bounds) if bounds else []
+
+        description = _text_in_column(column("项目名称", (0, description_end)), 0, width + 1)
+        specification = _text_in_column(column("规格型号", (description_end, width * .31)), 0, width + 1)
+        unit = _text_in_column(column("单位", (width * .31, width * .42)), 0, width + 1)
+        quantity = _first_decimal(column("数量", (width * .42, width * .49)), 0, width + 1)
+        unit_price = _first_decimal(column("单价", (width * .49, width * .66)), 0, width + 1)
         amount = _decimal(anchor[4])
-        tax_rate = _text_in_column(row_words, width * 0.76, width * 0.90)
-        tax_amount = _first_decimal(row_words, width * 0.90, width + 1)
+        tax_rate = _text_in_column(column("税率/征收率", (width * .76, width * .90)), 0, width + 1)
+        tax_amount = _first_decimal(column("税额", (width * .90, width + 1)), 0, width + 1)
         raw_text = " ".join(
             str(word[4]).strip() for word in sorted(row_words, key=lambda value: (value[1], value[0]))
         )
@@ -286,20 +377,6 @@ def _parse_items_from_page(page) -> list[InvoiceItem]:
             )
         )
     return items
-
-
-def _previous_meaningful_line(lines: list[str], target_tax: str) -> str:
-    for index, line in enumerate(lines):
-        if _normalise_tax_id(line) != target_tax:
-            continue
-        for candidate_index in range(index - 1, -1, -1):
-            candidate = lines[candidate_index]
-            if candidate in {"名称：", "名称:", "统一社会信用代码/纳税人识别号：", "统一社会信用代码/纳税人识别号:"}:
-                continue
-            if re.fullmatch(r"20\d{2}年.*日", candidate) or re.fullmatch(r"\d{20}", candidate):
-                continue
-            return candidate
-    return ""
 
 
 def _warning(warnings: list[InvoiceWarning], code: str, message: str, field: str = "") -> None:
@@ -354,19 +431,11 @@ def parse_invoice(pdf_path: str | Path) -> InvoiceData:
     else:
         _warning(warnings, "MISSING_INVOICE_DATE", "未识别到开票日期。", "invoice_date")
 
-    tax_candidates = []
-    for line in lines:
-        candidate = _normalise_tax_id(line)
-        if re.fullmatch(r"[0-9A-Z]{18}", candidate) and candidate not in tax_candidates:
-            tax_candidates.append(candidate)
-    buyer_tax_id = parties[1] or (tax_candidates[0] if tax_candidates else "")
-    seller_tax_id = parties[3] or (tax_candidates[1] if len(tax_candidates) > 1 else "")
+    buyer_name, buyer_tax_id, seller_name, seller_tax_id = parties
     if not buyer_tax_id:
         _warning(warnings, "MISSING_BUYER_TAX_ID", "未识别到购买方税号。", "buyer_tax_id")
     if not seller_tax_id:
         _warning(warnings, "MISSING_SELLER_TAX_ID", "未识别到销售方税号。", "seller_tax_id")
-    buyer_name = parties[0] or (_previous_meaningful_line(lines, buyer_tax_id) if buyer_tax_id else "")
-    seller_name = parties[2] or (_previous_meaningful_line(lines, seller_tax_id) if seller_tax_id else "")
     if not buyer_name:
         _warning(warnings, "MISSING_BUYER_NAME", "未识别到购买方名称。", "buyer_name")
     if not seller_name:
@@ -419,7 +488,7 @@ def parse_invoice(pdf_path: str | Path) -> InvoiceData:
     category_guess = _guess_category(item_name, seller_name)
     status = InvoiceStatus.REVIEW_REQUIRED if warnings else InvoiceStatus.PARSED_OK
 
-    return InvoiceData(
+    invoice = InvoiceData(
         source_pdf=str(pdf_path),
         invoice_no=invoice_no,
         invoice_date=invoice_date,
@@ -443,4 +512,13 @@ def parse_invoice(pdf_path: str | Path) -> InvoiceData:
         status=status,
         warnings=warnings,
         raw_text=text,
+        extracted_parties={
+            "buyer_name": parties[0], "buyer_tax_id": parties[1],
+            "seller_name": parties[2], "seller_tax_id": parties[3],
+        },
     )
+    snapshot = invoice.to_dict()
+    invoice.extracted_values = {key: snapshot[key] for key in (
+        "amount_without_tax", "tax_amount", "total_amount", "items",
+    )}
+    return invoice
